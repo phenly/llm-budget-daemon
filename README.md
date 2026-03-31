@@ -24,15 +24,15 @@ Example output:
 _Last updated: 2026-03-31T09:35:56 — next update in ~5 min_
 
 ## Session
-🟢 **96% remaining** (4% used) — resets in 11am (America/New_York)
+96% remaining (4% used) — resets in 11am (America/New_York)
 
 ## Weekly
-🟡 **38% remaining** (62% used) — resets in 12pm (America/New_York)
+38% remaining (62% used) — resets in 12pm (America/New_York)
 ```
 
-Status indicators: 🟢 ≥ 40% · 🟡 15–39% · 🔴 < 15%
+Raw numbers only — no pre-baked thresholds. The agent reading the file knows what task it's about to run; it decides whether the remaining budget is sufficient for that scope.
 
-If a scrape fails, the daemon preserves the last known good values and prepends a `⚠️ SCRAPE WARNING` block so agents know the data is stale.
+If a scrape fails, the daemon preserves the last known good values and prepends a `⚠️ SCRAPE WARNING` block so agents can detect stale data without parsing JSON.
 
 ## How it works
 
@@ -83,17 +83,26 @@ python3 ~/scripts/claude-budget-daemon.py --ensure-running
 tail -f ~/Library/Logs/budget-daemon.log
 ```
 
-## CLAUDE.md integration
+## Agent integration
 
-Add this to your `~/.claude/CLAUDE.md` to have Claude Code check budget at session start:
+The budget files are plain text — any agent or sub-agent can read them at any time, not just at session start. The intended pattern:
 
+**Session start** — ensure the daemon is running:
 ```markdown
 At session start, run in the background:
 python3 ~/scripts/claude-budget-daemon.py --ensure-running
-
-Before starting any large agentic task, read ~/.claude/budget/claude-budget.md.
-If session remaining is below 15%, warn the user before proceeding.
 ```
+
+**Before kicking off a task** — check remaining budget and factor it into planning:
+```markdown
+Before starting any multi-step task, read ~/.claude/budget/claude-budget.md
+and assess whether the remaining session and weekly budget is sufficient for
+the scope of the work. Adjust the plan or flag it to the user if not.
+```
+
+**Sub-agents** — because the files live on disk, any spawned sub-agent can read them independently without being passed budget context by the orchestrator. This is intentional: a sub-agent that's about to do something expensive can self-check.
+
+**Custom UIs** — the JSON sidecars (`claude-budget.json`, `codex-budget.json`) are designed for programmatic consumption. Poll them to display budget in a status bar, dashboard, or any other interface.
 
 ## Credits
 

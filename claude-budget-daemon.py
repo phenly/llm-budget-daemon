@@ -142,14 +142,6 @@ def normalize_space(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def remaining_status_icon(remaining_pct: int) -> str:
-    if remaining_pct >= 40:
-        return "🟢"
-    if remaining_pct >= 15:
-        return "🟡"
-    return "🔴"
-
-
 def warning_block(errors: list[str]) -> str:
     details = "; ".join(errors) if errors else "unknown scrape issue"
     return f"⚠️ SCRAPE WARNING: using last known good values. Errors: {details}\n\n"
@@ -431,16 +423,14 @@ def render_claude_markdown(payload: dict[str, Any], health: ScrapeHealth, timest
             "",
             "## Session",
             (
-                f"{remaining_status_icon(session['remaining_pct']) if isinstance(session['remaining_pct'], int) else '⚪'} "
-                f"**{fmt_or_unknown(session['remaining_pct'], '%')} remaining** "
-                f"({fmt_or_unknown(session['used_pct'], '%')} used) — resets in {session['resets_in'] or 'unknown'}"
+                f"{fmt_or_unknown(session['remaining_pct'], '%')} remaining"
+                f" ({fmt_or_unknown(session['used_pct'], '%')} used) — resets in {session['resets_in'] or 'unknown'}"
             ),
             "",
             "## Weekly",
             (
-                f"{remaining_status_icon(weekly['remaining_pct']) if isinstance(weekly['remaining_pct'], int) else '⚪'} "
-                f"**{fmt_or_unknown(weekly['remaining_pct'], '%')} remaining** "
-                f"({fmt_or_unknown(weekly['used_pct'], '%')} used) — resets in {weekly['resets_in'] or 'unknown'}"
+                f"{fmt_or_unknown(weekly['remaining_pct'], '%')} remaining"
+                f" ({fmt_or_unknown(weekly['used_pct'], '%')} used) — resets in {weekly['resets_in'] or 'unknown'}"
             ),
             "",
             "---",
@@ -468,16 +458,14 @@ def render_codex_markdown(payload: dict[str, Any], health: ScrapeHealth, timesta
             "",
             "## 5-Hour Limit",
             (
-                f"{remaining_status_icon(five_hour['remaining_pct']) if isinstance(five_hour['remaining_pct'], int) else '⚪'} "
-                f"**{fmt_or_unknown(five_hour['remaining_pct'], '%')} remaining** "
-                f"— resets {five_hour['resets_in'] or 'unknown'}"
+                f"{fmt_or_unknown(five_hour['remaining_pct'], '%')} remaining"
+                f" — resets {five_hour['resets_in'] or 'unknown'}"
             ),
             "",
             "## Weekly Limit",
             (
-                f"{remaining_status_icon(weekly['remaining_pct']) if isinstance(weekly['remaining_pct'], int) else '⚪'} "
-                f"**{fmt_or_unknown(weekly['remaining_pct'], '%')} remaining** "
-                f"— resets {weekly['resets_in'] or 'unknown'}"
+                f"{fmt_or_unknown(weekly['remaining_pct'], '%')} remaining"
+                f" — resets {weekly['resets_in'] or 'unknown'}"
             ),
             "",
             "---",
