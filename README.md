@@ -61,11 +61,17 @@ Codex state machine:
 ## Setup
 
 ```bash
-pip install pexpect pyte
-cp claude-budget-daemon.py ~/scripts/claude-budget-daemon.py
-cp com.phenly.budget-daemon.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.phenly.budget-daemon.plist
+git clone https://github.com/phenly/llm-budget-daemon
+cd llm-budget-daemon
+./install.sh
 ```
+
+The install script:
+1. Checks for Python 3.9+
+2. Installs `pexpect` and `pyte` via pip
+3. Copies the daemon to `~/scripts/`
+4. Installs and loads the launchd plist
+5. Runs a smoke test (`--once --debug`) to confirm both CLIs are scraped successfully
 
 ## Usage
 
