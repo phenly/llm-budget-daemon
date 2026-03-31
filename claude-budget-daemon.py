@@ -1,7 +1,7 @@
 """Budget daemon for Claude and Codex usage files.
 
-Setup: pip install playwright && playwright install chromium
-Usage: --auth (first-time setup), --once (single run), --debug (verbose), --ensure-running (idempotent start)
+Setup: pip install pexpect pyte
+Usage: --once (single run), --debug (verbose), --ensure-running (idempotent start)
 Install daemon: launchctl load ~/Library/LaunchAgents/com.phenly.budget-daemon.plist
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import re
 import signal
 import subprocess
@@ -17,25 +18,35 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from shutil import which
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+import pexpect
+import pyte
 
 
-CLAUDE_URL = "https://claude.ai/settings/usage"
-CODEX_URL = "https://chatgpt.com/codex/settings/usage"
 POLL_SECONDS = 300
 
 HOME = Path.home()
 BUDGET_DIR = HOME / ".claude" / "budget"
 PID_FILE = HOME / ".claude" / "budget-daemon.pid"
-PROFILE_DIR = BUDGET_DIR / "playwright-profile"
 CLAUDE_MD_PATH = BUDGET_DIR / "claude-budget.md"
 CLAUDE_JSON_PATH = BUDGET_DIR / "claude-budget.json"
 CODEX_MD_PATH = BUDGET_DIR / "codex-budget.md"
 CODEX_JSON_PATH = BUDGET_DIR / "codex-budget.json"
+CLI_TIMEOUT_SECONDS = 30
+CLI_FALLBACK_PATHS = {
+    "claude": ["/usr/local/bin/claude"],
+    "codex": ["/opt/homebrew/bin/codex"],
+}
+DEFAULT_PATH_SEGMENTS = [
+    str(HOME / ".local" / "bin"),
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/usr/bin",
+    "/bin",
+]
 
 STOP_REQUESTED = False
 
@@ -65,7 +76,6 @@ def log(message: str) -> None:
 
 def ensure_dirs() -> None:
     BUDGET_DIR.mkdir(parents=True, exist_ok=True)
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -140,16 +150,6 @@ def remaining_status_icon(remaining_pct: int) -> str:
     return "🔴"
 
 
-def extract_first_int(text: str) -> int | None:
-    match = re.search(r"(\d+)", text.replace(",", ""))
-    return int(match.group(1)) if match else None
-
-
-def extract_percent(text: str) -> int | None:
-    match = re.search(r"(\d+)\s*%", text)
-    return int(match.group(1)) if match else None
-
-
 def warning_block(errors: list[str]) -> str:
     details = "; ".join(errors) if errors else "unknown scrape issue"
     return f"⚠️ SCRAPE WARNING: using last known good values. Errors: {details}\n\n"
@@ -164,44 +164,114 @@ def build_scrape_health(errors: list[str], previous_json: dict[str, Any] | None,
     return ScrapeHealth(status="ok", errors=[], last_clean_scrape=timestamp)
 
 
-def js_extract_claude_progress(page: Any) -> list[dict[str, Any]]:
-    return page.evaluate(
-        """
-        () => {
-          const bars = Array.from(document.querySelectorAll('[role="progressbar"]'));
-          const findReset = (el) => {
-            let node = el;
-            for (let depth = 0; depth < 6 && node; depth += 1) {
-              const text = (node.textContent || '').replace(/\\s+/g, ' ').trim();
-              const match = text.match(/Resets in[^.\\n]*/i);
-              if (match) return match[0].trim();
-              node = node.parentElement;
-            }
-            return null;
-          };
-          return bars.map((el) => ({
-            aria: el.getAttribute('aria-valuenow'),
-            reset_text: findReset(el),
-            context: ((el.parentElement && el.parentElement.textContent) || '').replace(/\\s+/g, ' ').trim(),
-          }));
-        }
-        """
+def _render_screen(screen: Any) -> str:
+    lines = [line.rstrip() for line in screen.display]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _screen_contains(screen: Any, target_text: str) -> bool:
+    return any(target_text in line for line in screen.display)
+
+
+def _read_into_screen(child: Any, byte_stream: Any, timeout: float = 0.2) -> bool:
+    try:
+        data = child.read_nonblocking(size=10000, timeout=timeout)
+        if data:
+            byte_stream.feed(data)
+            return True
+    except pexpect.TIMEOUT:
+        return False
+    except pexpect.EOF:
+        return False
+    except OSError:
+        return False
+    return False
+
+
+def _wait_for_screen_text(
+    child: Any,
+    screen: Any,
+    byte_stream: Any,
+    target_text: str,
+    timeout: float,
+) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _screen_contains(screen, target_text):
+            return True
+        _read_into_screen(child, byte_stream, timeout=0.2)
+    return _screen_contains(screen, target_text)
+
+
+def _wait_for_stable_screen(
+    child: Any,
+    byte_stream: Any,
+    stable_for: float,
+    timeout: float,
+) -> None:
+    deadline = time.time() + timeout
+    last_activity = time.time()
+    while time.time() < deadline:
+        if _read_into_screen(child, byte_stream, timeout=0.2):
+            last_activity = time.time()
+            continue
+        if time.time() - last_activity >= stable_for:
+            return
+
+
+def _spawn_cli(command: str) -> tuple[Any, Any, Any]:
+    executable = which(command)
+    if executable is None:
+        for candidate in CLI_FALLBACK_PATHS.get(command, []):
+            if Path(candidate).exists():
+                executable = candidate
+                break
+    if executable is None:
+        raise RuntimeError(f"{command} not found in PATH")
+
+    screen = pyte.Screen(220, 50)
+    byte_stream = pyte.ByteStream(screen)
+    user_info = pwd.getpwuid(os.getuid())
+    child_env = dict(os.environ)
+    child_env.setdefault("HOME", str(HOME))
+    child_env.setdefault("USER", user_info.pw_name)
+    child_env.setdefault("LOGNAME", user_info.pw_name)
+    child_env.setdefault("SHELL", user_info.pw_shell or "/bin/zsh")
+    path_segments = [segment for segment in child_env.get("PATH", "").split(":") if segment]
+    for segment in reversed(DEFAULT_PATH_SEGMENTS):
+        if segment not in path_segments:
+            path_segments.insert(0, segment)
+    child_env["PATH"] = ":".join(path_segments)
+    child = pexpect.spawn(
+        executable,
+        encoding=None,
+        timeout=CLI_TIMEOUT_SECONDS,
+        dimensions=(50, 220),
+        env=child_env,
+    )
+    return child, screen, byte_stream
+
+
+def parse_claude_output(raw_text: str) -> tuple[dict[str, Any], list[str]]:
+    errors: list[str] = []
+
+    session_match = re.search(
+        r"Current session.*?(\d+)%\s+used.*?Resets\s+([^\r\n]+)",
+        raw_text,
+        re.DOTALL,
+    )
+    weekly_match = re.search(
+        r"Current week(?:\s+\(all models\))?.*?(\d+)%\s+used.*?Resets\s+([^\r\n]+)",
+        raw_text,
+        re.DOTALL,
     )
 
-
-def scrape_claude(page: Any) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
-    page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_selector('[role="progressbar"]', timeout=30000)
-    page.wait_for_timeout(2000)
-    raw_entries = js_extract_claude_progress(page)
-    errors: list[str] = []
-    if len(raw_entries) < 2:
-        errors.append(f"expected 2 Claude progress bars, found {len(raw_entries)}")
-
-    session_used = extract_first_int(str(raw_entries[0].get("aria"))) if len(raw_entries) > 0 else None
-    session_reset = raw_entries[0].get("reset_text") if len(raw_entries) > 0 else None
-    weekly_used = extract_first_int(str(raw_entries[1].get("aria"))) if len(raw_entries) > 1 else None
-    weekly_reset = raw_entries[1].get("reset_text") if len(raw_entries) > 1 else None
+    session_used = int(session_match.group(1)) if session_match else None
+    session_reset = normalize_space(session_match.group(2)) if session_match else None
+    weekly_used = int(weekly_match.group(1)) if weekly_match else None
+    weekly_reset = normalize_space(weekly_match.group(2)) if weekly_match else None
 
     if session_used is None:
         errors.append("claude.session.used_pct missing")
@@ -224,54 +294,90 @@ def scrape_claude(page: Any) -> tuple[dict[str, Any], list[str], list[dict[str, 
             "resets_in": weekly_reset,
         },
     }
-    return data, errors, raw_entries
+    return data, errors
 
 
-def scrape_codex(page: Any) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
-    page.goto(CODEX_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_selector("article", timeout=30000)
-    page.wait_for_timeout(2000)
-    cards = page.locator("article")
-    raw_cards: list[dict[str, Any]] = []
-    for index in range(cards.count()):
-        text = normalize_space(cards.nth(index).inner_text())
-        raw_cards.append({"index": index, "text": text})
-
+def parse_codex_output(raw_text: str) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
-    mapped: dict[str, Any] = {
-        "five_hour": None,
-        "weekly": None,
-        "code_review": None,
-        "credits": None,
-    }
 
-    for card in raw_cards:
-        lowered = card["text"].lower()
-        if "5-hour limit" in lowered:
-            mapped["five_hour"] = extract_percent(card["text"])
-        elif "weekly limit" in lowered:
-            mapped["weekly"] = extract_percent(card["text"])
-        elif "code review" in lowered:
-            mapped["code_review"] = extract_percent(card["text"])
-        elif "credit" in lowered:
-            mapped["credits"] = extract_first_int(card["text"])
+    five_hour_match = re.search(
+        r"5h limit:\s*\[[^\]]*]\s*(\d+)%\s+left(?:\s*\(resets\s+([^)]+)\))?",
+        raw_text,
+    )
+    weekly_match = re.search(
+        r"Weekly limit:\s*\[[^\]]*]\s*(\d+)%\s+left(?:\s*\(resets\s+([^)]+)\))?",
+        raw_text,
+    )
 
-    if mapped["five_hour"] is None:
+    status_bar_match = None if five_hour_match else re.search(r"·\s*(\d+)%\s+left\s*·", raw_text)
+
+    five_hour_remaining = int(five_hour_match.group(1)) if five_hour_match else None
+    five_hour_reset = normalize_space(five_hour_match.group(2)) if five_hour_match and five_hour_match.group(2) else None
+    weekly_remaining = int(weekly_match.group(1)) if weekly_match else None
+    weekly_reset = normalize_space(weekly_match.group(2)) if weekly_match and weekly_match.group(2) else None
+
+    if five_hour_remaining is None and status_bar_match:
+        five_hour_remaining = int(status_bar_match.group(1))
+
+    if five_hour_remaining is None:
         errors.append("codex.five_hour.remaining_pct missing")
-    if mapped["weekly"] is None:
+    if five_hour_reset is None:
+        errors.append("codex.five_hour.resets_in missing")
+    if weekly_remaining is None:
         errors.append("codex.weekly.remaining_pct missing")
-    if mapped["code_review"] is None:
-        errors.append("codex.code_review.remaining_pct missing")
-    if mapped["credits"] is None:
-        errors.append("codex.credits missing")
+    if weekly_reset is None:
+        errors.append("codex.weekly.resets_in missing")
 
     data = {
-        "five_hour": {"remaining_pct": mapped["five_hour"]},
-        "weekly": {"remaining_pct": mapped["weekly"]},
-        "code_review": {"remaining_pct": mapped["code_review"]},
-        "credits": mapped["credits"],
+        "five_hour": {
+            "remaining_pct": five_hour_remaining,
+            "resets_in": five_hour_reset,
+        },
+        "weekly": {
+            "remaining_pct": weekly_remaining,
+            "resets_in": weekly_reset,
+        },
     }
-    return data, errors, raw_cards
+    return data, errors
+
+
+def scrape_claude() -> tuple[dict[str, Any], list[str], str]:
+    child, screen, byte_stream = _spawn_cli("claude")
+    try:
+        _wait_for_screen_text(child, screen, byte_stream, "Claude Code v", timeout=10.0)
+        child.send(b"/usage")
+        _wait_for_screen_text(child, screen, byte_stream, "/usage", timeout=5.0)
+        child.send(b"\r")
+        _wait_for_screen_text(child, screen, byte_stream, "Current session", timeout=15.0)
+        _wait_for_stable_screen(child, byte_stream, stable_for=0.75, timeout=3.0)
+        raw_text = _render_screen(screen)
+    finally:
+        if child.isalive():
+            child.close(force=True)
+    data, errors = parse_claude_output(raw_text)
+    return data, errors, raw_text
+
+
+def scrape_codex() -> tuple[dict[str, Any], list[str], str]:
+    child, screen, byte_stream = _spawn_cli("codex")
+    try:
+        if not _wait_for_screen_text(child, screen, byte_stream, "5h limit", timeout=10.0):
+            _wait_for_stable_screen(child, byte_stream, stable_for=2.0, timeout=5.0)
+            child.send(b"/status")
+            _wait_for_screen_text(child, screen, byte_stream, "/status", timeout=5.0)
+            child.send(b"\r")
+            if not _wait_for_screen_text(child, screen, byte_stream, "5h limit", timeout=20.0):
+                child.send(b"/status")
+                _wait_for_screen_text(child, screen, byte_stream, "/status", timeout=5.0)
+                child.send(b"\r")
+                _wait_for_screen_text(child, screen, byte_stream, "5h limit", timeout=20.0)
+        _wait_for_stable_screen(child, byte_stream, stable_for=0.75, timeout=3.0)
+        raw_text = _render_screen(screen)
+    finally:
+        if child.isalive():
+            child.close(force=True)
+    data, errors = parse_codex_output(raw_text)
+    return data, errors, raw_text
 
 
 def load_preserved_claude(previous_json: dict[str, Any] | None) -> dict[str, Any]:
@@ -291,10 +397,14 @@ def load_preserved_claude(previous_json: dict[str, Any] | None) -> dict[str, Any
 
 def load_preserved_codex(previous_json: dict[str, Any] | None) -> dict[str, Any]:
     return {
-        "five_hour": {"remaining_pct": previous_json.get("five_hour", {}).get("remaining_pct") if previous_json else None},
-        "weekly": {"remaining_pct": previous_json.get("weekly", {}).get("remaining_pct") if previous_json else None},
-        "code_review": {"remaining_pct": previous_json.get("code_review", {}).get("remaining_pct") if previous_json else None},
-        "credits": previous_json.get("credits") if previous_json else None,
+        "five_hour": {
+            "remaining_pct": previous_json.get("five_hour", {}).get("remaining_pct") if previous_json else None,
+            "resets_in": previous_json.get("five_hour", {}).get("resets_in") if previous_json else None,
+        },
+        "weekly": {
+            "remaining_pct": previous_json.get("weekly", {}).get("remaining_pct") if previous_json else None,
+            "resets_in": previous_json.get("weekly", {}).get("resets_in") if previous_json else None,
+        },
     }
 
 
@@ -341,10 +451,8 @@ def render_claude_markdown(payload: dict[str, Any], health: ScrapeHealth, timest
 
 
 def render_codex_markdown(payload: dict[str, Any], health: ScrapeHealth, timestamp: str, stopped: bool = False) -> str:
-    five_hour = payload["five_hour"]["remaining_pct"]
-    weekly = payload["weekly"]["remaining_pct"]
-    code_review = payload["code_review"]["remaining_pct"]
-    credits = payload["credits"]
+    five_hour = payload["five_hour"]
+    weekly = payload["weekly"]
 
     lines: list[str] = []
     if stopped:
@@ -359,16 +467,18 @@ def render_codex_markdown(payload: dict[str, Any], health: ScrapeHealth, timesta
             f"_Last updated: {timestamp} — next update in ~5 min_",
             "",
             "## 5-Hour Limit",
-            f"{remaining_status_icon(five_hour) if isinstance(five_hour, int) else '⚪'} **{fmt_or_unknown(five_hour, '%')} remaining**",
+            (
+                f"{remaining_status_icon(five_hour['remaining_pct']) if isinstance(five_hour['remaining_pct'], int) else '⚪'} "
+                f"**{fmt_or_unknown(five_hour['remaining_pct'], '%')} remaining** "
+                f"— resets {five_hour['resets_in'] or 'unknown'}"
+            ),
             "",
             "## Weekly Limit",
-            f"{remaining_status_icon(weekly) if isinstance(weekly, int) else '⚪'} **{fmt_or_unknown(weekly, '%')} remaining**",
-            "",
-            "## Code Review",
-            f"{remaining_status_icon(code_review) if isinstance(code_review, int) else '⚪'} **{fmt_or_unknown(code_review, '%')} remaining**",
-            "",
-            "## Credits Remaining",
-            f"**{credits:,} credits** — extends beyond plan limits" if isinstance(credits, int) else "**unknown credits** — extends beyond plan limits",
+            (
+                f"{remaining_status_icon(weekly['remaining_pct']) if isinstance(weekly['remaining_pct'], int) else '⚪'} "
+                f"**{fmt_or_unknown(weekly['remaining_pct'], '%')} remaining** "
+                f"— resets {weekly['resets_in'] or 'unknown'}"
+            ),
             "",
             "---",
             "_This file is managed by budget-daemon. Do not edit manually._",
@@ -391,8 +501,6 @@ def build_codex_json(payload: dict[str, Any], health: ScrapeHealth, timestamp: s
         "last_updated": timestamp,
         "five_hour": payload["five_hour"],
         "weekly": payload["weekly"],
-        "code_review": payload["code_review"],
-        "credits": payload["credits"],
         "scrape_health": health.to_dict(),
     }
 
@@ -416,11 +524,10 @@ def process_codex_result(scraped: dict[str, Any], errors: list[str], timestamp: 
     health = build_scrape_health(errors, previous_json, timestamp)
     if health.status == "degraded":
         payload = load_preserved_codex(previous_json)
-        for key in ("five_hour", "weekly", "code_review"):
-            if payload[key]["remaining_pct"] is None and scraped.get(key, {}).get("remaining_pct") is not None:
-                payload[key]["remaining_pct"] = scraped[key]["remaining_pct"]
-        if payload["credits"] is None and scraped.get("credits") is not None:
-            payload["credits"] = scraped["credits"]
+        for key in ("five_hour", "weekly"):
+            for field, value in scraped.get(key, {}).items():
+                if payload[key].get(field) is None and value is not None:
+                    payload[key][field] = value
     else:
         payload = scraped
     return payload, health
@@ -452,65 +559,46 @@ def write_stopped_notices() -> None:
 
 
 def scrape_all(debug: bool = False) -> tuple[dict[str, Any], dict[str, Any], list[str], list[str]]:
-    with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=True,
-            viewport={"width": 1440, "height": 1200},
-        )
-        try:
-            page = context.new_page()
-            try:
-                claude_data, claude_errors, claude_raw = scrape_claude(page)
-            except Exception as exc:
-                claude_data = {
-                    "session": {"used_pct": None, "remaining_pct": None, "resets_in": None},
-                    "weekly": {"used_pct": None, "remaining_pct": None, "resets_in": None},
-                }
-                claude_errors = [f"claude scrape failed: {exc}"]
-                claude_raw = {"error": str(exc)}
+    try:
+        claude_data, claude_errors, claude_raw = scrape_claude()
+    except Exception as exc:
+        claude_data = {
+            "session": {"used_pct": None, "remaining_pct": None, "resets_in": None},
+            "weekly": {"used_pct": None, "remaining_pct": None, "resets_in": None},
+        }
+        claude_errors = [f"claude scrape failed: {exc}"]
+        claude_raw = str(exc)
 
-            try:
-                codex_data, codex_errors, codex_raw = scrape_codex(page)
-            except Exception as exc:
-                codex_data = {
-                    "five_hour": {"remaining_pct": None},
-                    "weekly": {"remaining_pct": None},
-                    "code_review": {"remaining_pct": None},
-                    "credits": None,
-                }
-                codex_errors = [f"codex scrape failed: {exc}"]
-                codex_raw = {"error": str(exc)}
-            if debug:
-                print(
-                    json.dumps(
-                        {
-                            "claude_raw": claude_raw,
-                            "codex_raw": codex_raw,
-                            "claude_parsed": claude_data,
-                            "codex_parsed": codex_data,
-                        },
-                        indent=2,
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-            return claude_data, codex_data, claude_errors, codex_errors
-        finally:
-            context.close()
+    try:
+        codex_data, codex_errors, codex_raw = scrape_codex()
+    except Exception as exc:
+        codex_data = {
+            "five_hour": {"remaining_pct": None, "resets_in": None},
+            "weekly": {"remaining_pct": None, "resets_in": None},
+        }
+        codex_errors = [f"codex scrape failed: {exc}"]
+        codex_raw = str(exc)
+    if debug:
+        print(
+            json.dumps(
+                {
+                    "claude_raw": claude_raw,
+                    "codex_raw": codex_raw,
+                    "claude_parsed": claude_data,
+                    "codex_parsed": codex_data,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    return claude_data, codex_data, claude_errors, codex_errors
 
 
 def run_once(debug: bool = False) -> int:
     ensure_dirs()
     timestamp = now_iso()
-    try:
-        claude_scraped, codex_scraped, claude_errors, codex_errors = scrape_all(debug=debug)
-    except PlaywrightTimeoutError as exc:
-        log(f"browser startup timeout: {exc}")
-        return 1
-    except Exception as exc:
-        log(f"browser startup failure: {exc}")
-        return 1
+    claude_scraped, codex_scraped, claude_errors, codex_errors = scrape_all(debug=debug)
 
     claude_payload, claude_health = process_claude_result(claude_scraped, claude_errors, timestamp)
     codex_payload, codex_health = process_codex_result(codex_scraped, codex_errors, timestamp)
@@ -525,28 +613,6 @@ def run_once(debug: bool = False) -> int:
     if codex_health.errors:
         log(f"codex scrape issues: {', '.join(codex_health.errors)}")
     return 0 if not claude_health.errors and not codex_health.errors else 1
-
-
-def run_auth_flow() -> int:
-    ensure_dirs()
-    log("opening headed Chromium for manual authentication")
-    with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,
-            viewport={"width": 1440, "height": 1200},
-        )
-        try:
-            claude_page = context.new_page()
-            codex_page = context.new_page()
-            claude_page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=60000)
-            codex_page.goto(CODEX_URL, wait_until="domcontentloaded", timeout=60000)
-            log("sign in to both services, then close the browser window to finish")
-            while context.pages:
-                context.pages[0].wait_for_timeout(1000)
-        finally:
-            context.close()
-    return 0
 
 
 def ensure_running() -> int:
@@ -586,8 +652,7 @@ def poll_loop(debug: bool = False) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scrape Claude and Codex budget usage into local markdown and JSON files.")
-    parser.add_argument("--auth", action="store_true", help="open a headed browser for first-time authentication")
+    parser = argparse.ArgumentParser(description="Poll Claude and Codex CLI budget usage into local markdown and JSON files.")
     parser.add_argument("--once", action="store_true", help="run a single scrape cycle and exit")
     parser.add_argument("--debug", action="store_true", help="print raw scrape output")
     parser.add_argument("--ensure-running", action="store_true", help="start the daemon if it is not already running")
@@ -599,8 +664,6 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_signal)
     args = parse_args()
 
-    if args.auth:
-        return run_auth_flow()
     if args.ensure_running:
         return ensure_running()
     if args.once:
