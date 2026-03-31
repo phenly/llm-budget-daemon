@@ -65,6 +65,55 @@ class ScrapeHealth:
         }
 
 
+class PersistentCLISession:
+    def __init__(self, command: str):
+        self.command = command
+        self.child: Any | None = None
+        self.screen: Any | None = None
+        self.byte_stream: Any | None = None
+
+    def start(self) -> None:
+        self.close()
+        child, screen, byte_stream = _spawn_cli(self.command)
+        self.child = child
+        self.screen = screen
+        self.byte_stream = byte_stream
+
+        if self.command == "claude":
+            if not _wait_for_screen_text(child, screen, byte_stream, "Claude Code v", timeout=10.0):
+                raise RuntimeError("claude startup banner not detected")
+            if not _wait_for_screen_text(child, screen, byte_stream, "❯", timeout=10.0):
+                raise RuntimeError("claude prompt not detected")
+            return
+
+        if self.command == "codex":
+            if _wait_for_screen_text(child, screen, byte_stream, "5h limit", timeout=10.0):
+                return
+            if not _wait_for_screen_text(child, screen, byte_stream, "›", timeout=10.0):
+                raise RuntimeError("codex prompt not detected")
+            return
+
+        raise RuntimeError(f"unsupported persistent CLI command: {self.command}")
+
+    def is_alive(self) -> bool:
+        return bool(self.child and self.child.isalive())
+
+    def ensure_alive(self) -> None:
+        if not self.is_alive():
+            self.start()
+
+    def close(self) -> None:
+        if self.child is not None and self.child.isalive():
+            self.child.close(force=True)
+        self.child = None
+        self.screen = None
+        self.byte_stream = None
+
+
+_claude_session = PersistentCLISession("claude")
+_codex_session = PersistentCLISession("codex")
+
+
 def now_iso() -> str:
     return datetime.now().replace(microsecond=0).isoformat()
 
@@ -246,6 +295,11 @@ def _spawn_cli(command: str) -> tuple[Any, Any, Any]:
     return child, screen, byte_stream
 
 
+def initialize_sessions() -> None:
+    _claude_session.ensure_alive()
+    _codex_session.ensure_alive()
+
+
 def parse_claude_output(raw_text: str) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
 
@@ -334,40 +388,48 @@ def parse_codex_output(raw_text: str) -> tuple[dict[str, Any], list[str]]:
 
 
 def scrape_claude() -> tuple[dict[str, Any], list[str], str]:
-    child, screen, byte_stream = _spawn_cli("claude")
-    try:
-        _wait_for_screen_text(child, screen, byte_stream, "Claude Code v", timeout=10.0)
-        child.send(b"/usage")
-        _wait_for_screen_text(child, screen, byte_stream, "/usage", timeout=5.0)
-        child.send(b"\r")
-        _wait_for_screen_text(child, screen, byte_stream, "Current session", timeout=15.0)
-        _wait_for_stable_screen(child, byte_stream, stable_for=0.75, timeout=3.0)
-        raw_text = _render_screen(screen)
-    finally:
-        if child.isalive():
-            child.close(force=True)
+    _claude_session.ensure_alive()
+    child = _claude_session.child
+    screen = _claude_session.screen
+    byte_stream = _claude_session.byte_stream
+    if child is None or screen is None or byte_stream is None:
+        raise RuntimeError("claude session unavailable")
+
+    child.send(b"/usage")
+    _wait_for_screen_text(child, screen, byte_stream, "/usage", timeout=5.0)
+    child.send(b"\r")
+    _wait_for_screen_text(child, screen, byte_stream, "Current session", timeout=15.0)
+    _wait_for_stable_screen(child, byte_stream, stable_for=0.75, timeout=3.0)
+    raw_text = _render_screen(screen)
+    child.send(b"\x1b")
+    _wait_for_screen_text(child, screen, byte_stream, "❯", timeout=5.0)
     data, errors = parse_claude_output(raw_text)
     return data, errors, raw_text
 
 
 def scrape_codex() -> tuple[dict[str, Any], list[str], str]:
-    child, screen, byte_stream = _spawn_cli("codex")
-    try:
-        if not _wait_for_screen_text(child, screen, byte_stream, "5h limit", timeout=10.0):
-            _wait_for_stable_screen(child, byte_stream, stable_for=2.0, timeout=5.0)
-            child.send(b"/status")
-            _wait_for_screen_text(child, screen, byte_stream, "/status", timeout=5.0)
-            child.send(b"\r")
-            if not _wait_for_screen_text(child, screen, byte_stream, "5h limit", timeout=20.0):
-                child.send(b"/status")
-                _wait_for_screen_text(child, screen, byte_stream, "/status", timeout=5.0)
-                child.send(b"\r")
-                _wait_for_screen_text(child, screen, byte_stream, "5h limit", timeout=20.0)
-        _wait_for_stable_screen(child, byte_stream, stable_for=0.75, timeout=3.0)
-        raw_text = _render_screen(screen)
-    finally:
-        if child.isalive():
-            child.close(force=True)
+    _codex_session.ensure_alive()
+    child = _codex_session.child
+    screen = _codex_session.screen
+    byte_stream = _codex_session.byte_stream
+    if child is None or screen is None or byte_stream is None:
+        raise RuntimeError("codex session unavailable")
+
+    _wait_for_stable_screen(child, byte_stream, stable_for=2.0, timeout=5.0)
+    child.send(b"/status")
+    _wait_for_screen_text(child, screen, byte_stream, "/status", timeout=5.0)
+    child.send(b"\r")
+    if not _wait_for_screen_text(child, screen, byte_stream, "5h limit", timeout=20.0):
+        child.send(b"/status")
+        _wait_for_screen_text(child, screen, byte_stream, "/status", timeout=5.0)
+        child.send(b"\r")
+        _wait_for_screen_text(child, screen, byte_stream, "5h limit", timeout=20.0)
+    _wait_for_stable_screen(child, byte_stream, stable_for=0.75, timeout=3.0)
+    raw_text = _render_screen(screen)
+    child.send(b"\x1b")
+    if not _wait_for_screen_text(child, screen, byte_stream, "›", timeout=5.0):
+        child.send(b"\x03")
+        _wait_for_screen_text(child, screen, byte_stream, "›", timeout=5.0)
     data, errors = parse_codex_output(raw_text)
     return data, errors, raw_text
 
@@ -583,24 +645,32 @@ def scrape_all(debug: bool = False) -> tuple[dict[str, Any], dict[str, Any], lis
     return claude_data, codex_data, claude_errors, codex_errors
 
 
-def run_once(debug: bool = False) -> int:
+def run_once(debug: bool = False, manage_sessions: bool = True) -> int:
     ensure_dirs()
-    timestamp = now_iso()
-    claude_scraped, codex_scraped, claude_errors, codex_errors = scrape_all(debug=debug)
+    try:
+        if manage_sessions:
+            initialize_sessions()
 
-    claude_payload, claude_health = process_claude_result(claude_scraped, claude_errors, timestamp)
-    codex_payload, codex_health = process_codex_result(codex_scraped, codex_errors, timestamp)
-    write_outputs(claude_payload, claude_health, codex_payload, codex_health, timestamp)
+        timestamp = now_iso()
+        claude_scraped, codex_scraped, claude_errors, codex_errors = scrape_all(debug=debug)
 
-    log(
-        "cycle complete: "
-        f"claude={claude_health.status} codex={codex_health.status}"
-    )
-    if claude_health.errors:
-        log(f"claude scrape issues: {', '.join(claude_health.errors)}")
-    if codex_health.errors:
-        log(f"codex scrape issues: {', '.join(codex_health.errors)}")
-    return 0 if not claude_health.errors and not codex_health.errors else 1
+        claude_payload, claude_health = process_claude_result(claude_scraped, claude_errors, timestamp)
+        codex_payload, codex_health = process_codex_result(codex_scraped, codex_errors, timestamp)
+        write_outputs(claude_payload, claude_health, codex_payload, codex_health, timestamp)
+
+        log(
+            "cycle complete: "
+            f"claude={claude_health.status} codex={codex_health.status}"
+        )
+        if claude_health.errors:
+            log(f"claude scrape issues: {', '.join(claude_health.errors)}")
+        if codex_health.errors:
+            log(f"codex scrape issues: {', '.join(codex_health.errors)}")
+        return 0 if not claude_health.errors and not codex_health.errors else 1
+    finally:
+        if manage_sessions:
+            _claude_session.close()
+            _codex_session.close()
 
 
 def ensure_running() -> int:
@@ -626,14 +696,17 @@ def poll_loop(debug: bool = False) -> int:
     write_pid_file()
     log("daemon started")
     try:
+        initialize_sessions()
         while not STOP_REQUESTED:
-            run_once(debug=debug)
+            run_once(debug=debug, manage_sessions=False)
             slept = 0
             while slept < POLL_SECONDS and not STOP_REQUESTED:
                 time.sleep(1)
                 slept += 1
     finally:
         write_stopped_notices()
+        _claude_session.close()
+        _codex_session.close()
         remove_pid_file_if_owned()
         log("daemon stopped")
     return 0
