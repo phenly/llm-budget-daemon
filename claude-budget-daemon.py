@@ -36,6 +36,17 @@ CLAUDE_JSON_PATH = BUDGET_DIR / "claude-budget.json"
 CODEX_MD_PATH = BUDGET_DIR / "codex-budget.md"
 CODEX_JSON_PATH = BUDGET_DIR / "codex-budget.json"
 CLI_TIMEOUT_SECONDS = 30
+# Stable-identity launcher: an ad-hoc-signed .app bundle with a fixed bundle id
+# (com.phenly.budget-daemon). Spawning CLIs through it means macOS TCC sees one
+# stable responsible process across claude/codex auto-updates, instead of a new
+# "app" per version (2.1.141, 2.1.146, ...). Set BUDGET_DAEMON_LAUNCHER to
+# override or empty-string to disable.
+LAUNCHER_PATH = Path(
+    os.environ.get(
+        "BUDGET_DAEMON_LAUNCHER",
+        str(HOME / "Applications" / "PhenlyBudgetDaemon.app" / "Contents" / "MacOS" / "launcher"),
+    )
+)
 CLI_FALLBACK_PATHS = {
     "claude": ["/usr/local/bin/claude"],
     "codex": ["/opt/homebrew/bin/codex"],
@@ -80,9 +91,11 @@ class PersistentCLISession:
         self.byte_stream = byte_stream
 
         if self.command == "claude":
-            if not _wait_for_screen_text(child, screen, byte_stream, "Claude Code v", timeout=10.0):
+            banner_seen = _wait_for_screen_text(child, screen, byte_stream, "Claude Code v", timeout=10.0)
+            # Some Claude launches skip the full banner but still reach a usable prompt.
+            if not banner_seen and not _wait_for_screen_text(child, screen, byte_stream, "❯", timeout=10.0):
                 raise RuntimeError("claude startup banner not detected")
-            if not _wait_for_screen_text(child, screen, byte_stream, "❯", timeout=10.0):
+            if not _screen_contains(screen, "❯") and not _wait_for_screen_text(child, screen, byte_stream, "❯", timeout=10.0):
                 raise RuntimeError("claude prompt not detected")
             return
 
@@ -263,14 +276,21 @@ def _wait_for_stable_screen(
 
 
 def _spawn_cli(command: str) -> tuple[Any, Any, Any]:
-    executable = which(command)
-    if executable is None:
-        for candidate in CLI_FALLBACK_PATHS.get(command, []):
-            if Path(candidate).exists():
-                executable = candidate
-                break
-    if executable is None:
-        raise RuntimeError(f"{command} not found in PATH")
+    use_launcher = bool(str(LAUNCHER_PATH)) and LAUNCHER_PATH.is_file() and os.access(LAUNCHER_PATH, os.X_OK)
+    if use_launcher:
+        executable = str(LAUNCHER_PATH)
+        args = [command]
+    else:
+        resolved = which(command)
+        if resolved is None:
+            for candidate in CLI_FALLBACK_PATHS.get(command, []):
+                if Path(candidate).exists():
+                    resolved = candidate
+                    break
+        if resolved is None:
+            raise RuntimeError(f"{command} not found in PATH")
+        executable = resolved
+        args = []
 
     screen = pyte.Screen(220, 50)
     byte_stream = pyte.ByteStream(screen)
@@ -285,12 +305,17 @@ def _spawn_cli(command: str) -> tuple[Any, Any, Any]:
         if segment not in path_segments:
             path_segments.insert(0, segment)
     child_env["PATH"] = ":".join(path_segments)
+    # Scope cwd to a directory we own so CLIs don't scan from launchd's "/"
+    # for project context — that was triggering Music/Photos/Drive TCC prompts.
+    BUDGET_DIR.mkdir(parents=True, exist_ok=True)
     child = pexpect.spawn(
         executable,
+        args=args,
         encoding=None,
         timeout=CLI_TIMEOUT_SECONDS,
         dimensions=(50, 220),
         env=child_env,
+        cwd=str(BUDGET_DIR),
     )
     return child, screen, byte_stream
 
@@ -609,25 +634,24 @@ def write_stopped_notices() -> None:
 
 
 def scrape_all(debug: bool = False) -> tuple[dict[str, Any], dict[str, Any], list[str], list[str]]:
-    try:
-        claude_data, claude_errors, claude_raw = scrape_claude()
-    except Exception as exc:
-        claude_data = {
+    claude_data, claude_errors, claude_raw = _scrape_with_recovery(
+        label="claude",
+        session=_claude_session,
+        scrape_fn=scrape_claude,
+        empty_payload={
             "session": {"used_pct": None, "remaining_pct": None, "resets_in": None},
             "weekly": {"used_pct": None, "remaining_pct": None, "resets_in": None},
-        }
-        claude_errors = [f"claude scrape failed: {exc}"]
-        claude_raw = str(exc)
-
-    try:
-        codex_data, codex_errors, codex_raw = scrape_codex()
-    except Exception as exc:
-        codex_data = {
+        },
+    )
+    codex_data, codex_errors, codex_raw = _scrape_with_recovery(
+        label="codex",
+        session=_codex_session,
+        scrape_fn=scrape_codex,
+        empty_payload={
             "five_hour": {"remaining_pct": None, "resets_in": None},
             "weekly": {"remaining_pct": None, "resets_in": None},
-        }
-        codex_errors = [f"codex scrape failed: {exc}"]
-        codex_raw = str(exc)
+        },
+    )
     if debug:
         print(
             json.dumps(
@@ -643,6 +667,38 @@ def scrape_all(debug: bool = False) -> tuple[dict[str, Any], dict[str, Any], lis
             flush=True,
         )
     return claude_data, codex_data, claude_errors, codex_errors
+
+
+def _scrape_with_recovery(
+    label: str,
+    session: PersistentCLISession,
+    scrape_fn: Any,
+    empty_payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], str]:
+    last_data = empty_payload
+    last_errors = [f"{label} scrape failed: unknown error"]
+    last_raw = "unknown error"
+
+    for attempt in range(2):
+        try:
+            data, errors, raw_text = scrape_fn()
+        except Exception as exc:
+            data = empty_payload
+            errors = [f"{label} scrape failed: {exc}"]
+            raw_text = str(exc)
+
+        last_data = data
+        last_errors = errors
+        last_raw = raw_text
+
+        if not errors:
+            return data, errors, raw_text
+
+        if attempt == 0:
+            log(f"{label} scrape issue detected; restarting {label} session and retrying")
+            session.close()
+
+    return last_data, last_errors, last_raw
 
 
 def run_once(debug: bool = False, manage_sessions: bool = True) -> int:

@@ -39,6 +39,25 @@ mkdir -p "$LAUNCH_AGENTS_DIR"
 cp "$PLIST_NAME" "$LAUNCH_AGENTS_DIR/$PLIST_NAME"
 echo "  installed: $LAUNCH_AGENTS_DIR/$PLIST_NAME"
 
+# Install stable-identity launcher bundle. macOS TCC keys permission decisions
+# on a binary's code identity / executable path; claude and codex install
+# themselves at versioned paths (e.g. ~/.local/share/claude/versions/2.1.146)
+# so every auto-update looks like a brand-new app and re-triggers Music /
+# Photos / Drive permission prompts. The bundle gives the daemon one stable
+# responsible-process identity (com.phenly.budget-daemon) that children
+# inherit, so a single TCC grant survives version bumps.
+BUNDLE_SRC="bundle/PhenlyBudgetDaemon.app"
+BUNDLE_DST="$HOME/Applications/PhenlyBudgetDaemon.app"
+if [ -d "$BUNDLE_SRC" ]; then
+  mkdir -p "$HOME/Applications"
+  rm -rf "$BUNDLE_DST"
+  cp -R "$BUNDLE_SRC" "$BUNDLE_DST"
+  chmod +x "$BUNDLE_DST/Contents/MacOS/launcher"
+  codesign --force --sign - --identifier com.phenly.budget-daemon "$BUNDLE_DST" >/dev/null 2>&1 \
+    || echo "  warning: codesign failed; launcher will still run but TCC may re-prompt"
+  echo "  installed: $BUNDLE_DST"
+fi
+
 # Load launchd agent (unload first if already loaded, to pick up any plist changes)
 if launchctl list | grep -q "$LABEL" 2>/dev/null; then
   echo "  unloading existing daemon..."

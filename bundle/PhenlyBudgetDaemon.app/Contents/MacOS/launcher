@@ -1,0 +1,43 @@
+#!/bin/bash
+# Stable-identity launcher for the budget daemon.
+#
+# Why: claude/codex install themselves at versioned paths (e.g.
+# ~/.local/share/claude/versions/2.1.146). Each auto-update changes the
+# executable path/CDHash, so macOS TCC treats every version as a fresh app
+# and re-prompts for Music/Photos/Drive/etc. By spawning the CLIs through
+# this fixed-path, ad-hoc-signed launcher (bundle id com.phenly.budget-daemon),
+# children inherit the launcher's responsible-process identity and TCC
+# decisions stick across version bumps.
+set -e
+
+cmd="${1:-}"
+shift || true
+
+resolve() {
+    local link="$1"
+    if [ -L "$link" ] || [ -e "$link" ]; then
+        /usr/bin/readlink -f "$link" 2>/dev/null || printf '%s' "$link"
+    fi
+}
+
+case "$cmd" in
+    claude)
+        target="$(resolve /usr/local/bin/claude)"
+        [ -z "$target" ] && target="$(resolve "$HOME/.local/bin/claude")"
+        ;;
+    codex)
+        target="$(resolve /opt/homebrew/bin/codex)"
+        [ -z "$target" ] && target="$(resolve /usr/local/bin/codex)"
+        ;;
+    *)
+        echo "usage: launcher {claude|codex} [args...]" >&2
+        exit 64
+        ;;
+esac
+
+if [ -z "$target" ] || [ ! -x "$target" ]; then
+    echo "launcher: could not resolve executable for '$cmd'" >&2
+    exit 127
+fi
+
+exec "$target" "$@"
