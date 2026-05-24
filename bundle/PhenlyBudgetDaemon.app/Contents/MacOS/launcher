@@ -1,17 +1,28 @@
 #!/bin/bash
-# Stable-identity launcher for the budget daemon.
+# Stable-path launcher for the budget daemon.
 #
-# Why: claude/codex install themselves at versioned paths (e.g.
-# ~/.local/share/claude/versions/2.1.146). Each auto-update changes the
-# executable path/CDHash, so macOS TCC treats every version as a fresh app
-# and re-prompts for Music/Photos/Drive/etc. By spawning the CLIs through
-# this fixed-path, ad-hoc-signed launcher (bundle id com.phenly.budget-daemon),
-# children inherit the launcher's responsible-process identity and TCC
-# decisions stick across version bumps.
+# Why: claude/codex are properly Developer-ID-signed by their publishers, but
+# they install at versioned paths whose *filename* is the version number
+# (e.g. ~/.local/share/claude/versions/2.1.142). macOS TCC keys its consent
+# records on the executable path; the per-version filename means every
+# auto-update is a brand-new "app" to TCC, which re-prompts for
+# Music/Photos/Documents/OneDrive/etc. The previous bundle-launcher attempt
+# did not solve this because we exec'd the inner versioned binary directly.
+#
+# Fix: maintain a stable-path hardlink to the current versioned binary inside
+# ~/.claude/budget/helpers/ and exec the hardlink. Hardlinks share the source
+# inode, so the publisher's code signature stays valid (same cdhash, same
+# Developer ID, same designated requirement). TCC sees:
+#   - stable path:        ~/.claude/budget/helpers/{claude,codex}
+#   - stable identity:    Anthropic PBC / OpenAI Developer ID
+# One grant survives all future version bumps.
 set -e
 
 cmd="${1:-}"
 shift || true
+
+HELPER_DIR="${BUDGET_DAEMON_HELPER_DIR:-$HOME/.claude/budget/helpers}"
+mkdir -p "$HELPER_DIR"
 
 resolve() {
     local link="$1"
@@ -22,12 +33,12 @@ resolve() {
 
 case "$cmd" in
     claude)
-        target="$(resolve /usr/local/bin/claude)"
-        [ -z "$target" ] && target="$(resolve "$HOME/.local/bin/claude")"
+        source="$(resolve /usr/local/bin/claude)"
+        [ -z "$source" ] && source="$(resolve "$HOME/.local/bin/claude")"
         ;;
     codex)
-        target="$(resolve /opt/homebrew/bin/codex)"
-        [ -z "$target" ] && target="$(resolve /usr/local/bin/codex)"
+        source="$(resolve /opt/homebrew/bin/codex)"
+        [ -z "$source" ] && source="$(resolve /usr/local/bin/codex)"
         ;;
     *)
         echo "usage: launcher {claude|codex} [args...]" >&2
@@ -35,9 +46,21 @@ case "$cmd" in
         ;;
 esac
 
-if [ -z "$target" ] || [ ! -x "$target" ]; then
+if [ -z "$source" ] || [ ! -x "$source" ]; then
     echo "launcher: could not resolve executable for '$cmd'" >&2
     exit 127
+fi
+
+target="$HELPER_DIR/$cmd"
+
+# Refresh the hardlink if missing or pointing at a stale (different inode) version.
+src_inode="$(/usr/bin/stat -f '%i' "$source" 2>/dev/null || echo '')"
+tgt_inode="$(/usr/bin/stat -f '%i' "$target" 2>/dev/null || echo '')"
+if [ -z "$tgt_inode" ] || [ "$src_inode" != "$tgt_inode" ]; then
+    /bin/rm -f "$target"
+    # Hardlink first (fast, preserves signature); fall back to copy if the
+    # source is on a different filesystem.
+    /bin/ln "$source" "$target" 2>/dev/null || /bin/cp -p "$source" "$target"
 fi
 
 exec "$target" "$@"

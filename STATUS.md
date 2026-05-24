@@ -1,5 +1,5 @@
 ## last updated
-agent: lead-engineer   date: 2026-05-22   session: 8
+agent: lead-engineer   date: 2026-05-24   session: 9
 
 ## project phase
 complete — in production with macOS TCC hardening
@@ -12,16 +12,17 @@ complete — in production with macOS TCC hardening
 - TASK-008: Synced repo script to ~/scripts/; hardened scrape_codex() with /status retry + 20s timeout
 - TASK-009: Removed status indicator emoji/thresholds from markdown output
 - TASK-010: Added install.sh, README, pushed to github.com/phenly/llm-budget-daemon
-- TASK-011: Stable-identity launcher bundle to stop macOS TCC re-prompting on every claude/codex version bump (2026-05-22)
+- TASK-011: Stable-identity launcher bundle to stop macOS TCC re-prompting on every claude/codex version bump (2026-05-22) — INSUFFICIENT, see TASK-012
+- TASK-012: Stable-path hardlink launcher to fully stop TCC re-prompting (2026-05-24). TASK-011's launcher used `exec` to jump straight to the versioned inner binary (e.g. `~/.local/share/claude/versions/2.1.142`); TCC keys consent on the executable's file path, and the filename literally is the version number, so every claude/codex auto-update still read as a new "app" to TCC and the prompts continued (user reported `"2.1.142" would like to access ... OneDrive / Documents / data from other apps`). The Anthropic Developer ID signature is already stable across versions — only the path varies. Fix: launcher now maintains hardlinks at `~/.claude/budget/helpers/{claude,codex}` to whichever versioned binary is current, and exec's the hardlink. Hardlinks share the source inode so the publisher's signature/cdhash stays valid; TCC sees stable path + stable Developer ID and one grant survives all future version bumps. The launcher self-heals: each spawn compares source vs. target inode and rebuilds the hardlink if claude/codex has auto-updated.
 
 ## in progress
 (none)
 
 ## next task
-(none — monitor whether TASK-011 fully eliminates TCC prompts after the next claude auto-update)
+(none — monitor that TCC prompts stop appearing on the next claude/codex auto-update)
 
 ## known follow-ups (not yet needed)
-- If macOS still attributes TCC prompts to the versioned inner binary (e.g. `2.1.146`) instead of the launcher bundle after the next claude update, add an auto `codesign --force --sign - --identifier com.phenly.claude-cli <resolved-path>` step inside `PersistentCLISession.ensure_alive()` (and the equivalent for codex). Trigger only when the resolved real-path changes.
+- If macOS still re-prompts after TASK-012 across a version bump, the next escalation is to also install the helper directory under a path TCC has already granted (e.g. inside the bundle's `Contents/Helpers/`) — but adding files inside a codesigned bundle requires re-signing the whole bundle. Keep helpers outside the bundle unless this becomes necessary.
 
 ## decisions log
 - 2026-03-30: output path → ~/.claude/budget/ for all 4 files (markdown + JSON)
